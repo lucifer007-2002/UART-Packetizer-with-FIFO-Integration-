@@ -1,49 +1,132 @@
-module uart_tx #(
-    parameter DATA_WIDTH = 8,
-    parameter CLK_FREQ = 50000000,
-    parameter BAUD_RATE = 115200
-) (
-    input                   clk,
-    input                   rst,
-    input                   tx_start,
-    input  [DATA_WIDTH-1:0] tx_data,
-    input                   tx_ready,      // ✅ Changed from output to input
-    output reg              serial_out
+`timescale 1ns / 1ps
+`include "uart_params.vh"
+//------------------------------------------------------------
+// uart_tx.v
+// UART transmitter — 8N1 format (8 data, no parity, 1 stop)
+//
+// Interface:
+//   valid + data → present a byte to transmit
+//   ready → 1 when TX can accept a new byte (not busy)
+//   tx    → serial output line (idle = 1)
+//
+// Handshake: transfer occurs when valid & ready in same cycle
+//
+// CRITICAL — valid must stay high until ready is seen:
+//   If valid deasserts before ready, the byte is lost.
+//   Packet FSM (Part 5) must hold valid until ready asserts.
+//
+// Shift register: LSB first (UART standard)
+//   bit 0 transmitted first, bit 7 last
+//   Reversed order = protocol violation, receiver gets garbage
+//
+// State machine:
+//   IDLE       → wait for valid, output tx=1 (idle high)
+//   START_BIT  → output tx=0 for exactly 1 bit period
+//   DATA_BITS  → shift out 8 bits LSB first, 1 per baud_tick
+//   STOP_BIT   → output tx=1 for exactly 1 bit period
+//   → back to IDLE, assert ready
+//------------------------------------------------------------
+
+// TX FSM state encoding
+`define TX_IDLE      2'd0
+`define TX_START     2'd1
+`define TX_DATA      2'd2
+`define TX_STOP      2'd3
+
+module uart_tx (
+    input  wire       clk,
+    input  wire       rst,
+    input  wire       baud_tick,   // 1-cycle pulse from baud_gen
+    input  wire [7:0] data,        // byte to transmit
+    input  wire       valid,       // data is valid, request TX
+    output reg        ready,       // 1 = can accept new byte
+    output reg        tx           // UART serial output
 );
 
-    localparam BIT_CNT = 10;
-    localparam BAUD_DIV = CLK_FREQ / BAUD_RATE;
+    // ── FSM state and datapath registers ─────────────────────
+    reg [1:0]  state;
+    reg [7:0]  shift_reg;           // data shift register
+    reg [2:0]  bit_cnt;             // counts 0..7 for data bits
 
-    reg [DATA_WIDTH+1:0] tx_shift_reg;     // Adjust width for start + stop + data
-    reg [3:0] bit_index = 0;
-    reg [15:0] baud_cnt = 0;
-    reg transmitting = 0;
-
+    // ── FSM — next state and output logic ────────────────────
     always @(posedge clk) begin
         if (rst) begin
-            serial_out <= 1;
-            transmitting <= 0;
-            bit_index <= 0;
-            baud_cnt <= 0;
+            state     <= `TX_IDLE;
+            shift_reg <= 8'h00;
+            bit_cnt   <= 3'd0;
+            tx        <= 1'b1;      // idle high — mandatory
+            ready     <= 1'b1;      // ready at reset
         end else begin
-            if (tx_start && tx_ready && !transmitting) begin
-                tx_shift_reg <= {1'b1, tx_data, 1'b0}; // {stop, data[7:0], start}
-                transmitting <= 1;
-                bit_index <= 0;
-                baud_cnt <= 0;
-            end else if (transmitting) begin
-                if (baud_cnt == BAUD_DIV - 1) begin
-                    baud_cnt <= 0;
-                    serial_out <= tx_shift_reg[bit_index];
-                    bit_index <= bit_index + 1;
-                    if (bit_index == BIT_CNT - 1) begin
-                        transmitting <= 0;
-                        serial_out <= 1;
+            case (state)
+
+                //──────────────────────────────────────────────
+                `TX_IDLE: begin
+                    tx    <= 1'b1;  // keep idle high
+                    ready <= 1'b1;
+
+                    if (valid) begin
+                        // Capture byte, move to start bit
+                        shift_reg <= data;
+                        ready     <= 1'b0;   // busy now
+                        state     <= `TX_START;
                     end
-                end else begin
-                    baud_cnt <= baud_cnt + 1;
                 end
-            end
+
+                //──────────────────────────────────────────────
+                `TX_START: begin
+                    // Start bit: drive tx LOW for exactly one
+                    // bit period (one baud_tick to next)
+                    tx    <= 1'b0;
+                    ready <= 1'b0;
+
+                    if (baud_tick) begin
+                        bit_cnt <= 3'd0;
+                        state   <= `TX_DATA;
+                    end
+                end
+
+                //──────────────────────────────────────────────
+                `TX_DATA: begin
+                    // Output LSB of shift register
+                    // Shift right on each baud_tick
+                    tx    <= shift_reg[0];
+                    ready <= 1'b0;
+
+                    if (baud_tick) begin
+                        shift_reg <= {1'b0, shift_reg[7:1]};  // SRL
+
+                        if (bit_cnt == 3'd7) begin
+                            // All 8 bits sent — go to stop bit
+                            state <= `TX_STOP;
+                        end else begin
+                            bit_cnt <= bit_cnt + 1'b1;
+                        end
+                    end
+                end
+
+                //──────────────────────────────────────────────
+                `TX_STOP: begin
+                    // Stop bit: drive tx HIGH for one bit period
+                    tx    <= 1'b1;
+                    ready <= 1'b0;
+
+                    if (baud_tick) begin
+                        // Done — return to IDLE
+                        // If another byte is waiting (valid=1),
+                        // the IDLE state catches it next cycle
+                        state <= `TX_IDLE;
+                        ready <= 1'b1;
+                    end
+                end
+
+                //──────────────────────────────────────────────
+                default: begin
+                    state <= `TX_IDLE;
+                    tx    <= 1'b1;
+                    ready <= 1'b1;
+                end
+
+            endcase
         end
     end
 
