@@ -62,22 +62,30 @@ module uart_top (
     );
 
     //==========================================================
-    // SECTION 2 — Reset synchronizer
-    // Async assert (immediate), sync deassert (2-FF chain)
-    // Prevents metastability on rst release
-    // Instantiated once here; drives all downstream modules
-    //==========================================================
-    wire rst_sync;    // synchronized reset output (active-high)
+   // SECTION 2 — Reset synchronizers (one per clock domain)
+// Both use the same async rst input but deassert independently
+//==========================================================
+wire rst_sync_wr;   // synchronized reset for write domain
+wire rst_sync_rd;   // synchronized reset for read domain
 
-    // reset_sync instantiated in Part 4
-    // reset_sync u_rst_sync (
-    //     .clk     (clk),
-    //     .rst_in  (rst),
-    //     .rst_out (rst_sync)
-    // );
+// In this single-clock design both map to same clk
+// For true two-clock design: replace rd clk with rd_clk
+reset_sync #(.STAGES(2)) u_rst_wr (
+    .clk     (clk),
+    .rst_in  (rst),
+    .rst_out (rst_sync_wr)
+);
 
-    // Temporary passthrough until Part 4
-    assign rst_sync = rst;
+reset_sync #(.STAGES(2)) u_rst_rd (
+    .clk     (clk),
+    .rst_in  (rst),
+    .rst_out (rst_sync_rd)
+);
+
+// Use rst_sync_wr for write-side logic (data source, FIFO wr)
+// Use rst_sync_rd for read-side logic (packet FSM, UART TX)
+wire rst_sync = rst_sync_wr;  // shared alias for single-clk modules
+
 
     //==========================================================
     // SECTION 3 — Baud tick generator
@@ -133,23 +141,24 @@ module uart_top (
     assign src_ready  = ~fifo_full;
 
     // async_fifo instantiated in Part 4
-    // async_fifo #(
-    //     .DATA_W (FIFO_WIDTH),
-    //     .DEPTH  (FIFO_DEPTH),
-    //     .ADDR_W (FIFO_ADDR_W),
-    //     .PTR_W  (FIFO_PTR_W)
-    // ) u_fifo (
-    //     .wr_clk   (clk),
-    //     .rd_clk   (clk),
-    //     .wr_rst   (rst_sync),
-    //     .rd_rst   (rst_sync),
-    //     .wr_en    (fifo_wr_en),
-    //     .wr_data  (src_data),
-    //     .rd_en    (fifo_rd_en),
-    //     .rd_data  (fifo_rdata),
-    //     .full     (fifo_full),
-    //     .empty    (fifo_empty)
-    // );
+async_fifo #(
+    .DATA_W (FIFO_WIDTH),
+    .DEPTH  (FIFO_DEPTH),
+    .ADDR_W (FIFO_ADDR_W),
+    .PTR_W  (FIFO_PTR_W)
+) u_fifo (
+    .wr_clk  (clk),
+    .wr_rst  (rst_sync_wr),
+    .wr_en   (fifo_wr_en),
+    .wr_data (src_data),
+    .full    (fifo_full),
+    .rd_clk  (clk),
+    .rd_rst  (rst_sync_rd),
+    .rd_en   (fifo_rd_en),
+    .rd_data (fifo_rdata),
+    .empty   (fifo_empty)
+);
+
 
     // Stubs until Part 4
     assign fifo_rdata = 8'h00;
